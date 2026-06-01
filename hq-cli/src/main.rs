@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Red Hat, Inc.
+// Licensed under the BSD 3-Clause License. See LICENSE file for details.
+
 use anstyle::{AnsiColor, Style};
 use clap::Parser;
 use hq_lib::{FileResult, LolHtmlEngine, scan};

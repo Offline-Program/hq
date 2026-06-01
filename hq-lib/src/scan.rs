@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Red Hat, Inc.
+// Licensed under the BSD 3-Clause License. See LICENSE file for details.
+
 use crate::{FileResult, Result, SelectorEngine};
 use jwalk::WalkDir;
 use rayon::prelude::*;
