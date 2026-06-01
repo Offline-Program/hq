@@ -1,0 +1,3 @@
+[workspace]
+members = ["hq-lib", "hq-cli"]
+resolver = "3"
