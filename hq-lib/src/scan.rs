@@ -3,6 +3,7 @@
 
 use crate::{FileResult, Result, SelectorEngine};
 use jwalk::WalkDir;
+use log::{debug, trace, warn};
 use rayon::prelude::*;
 use std::path::Path;
 
@@ -13,6 +14,7 @@ pub fn count_matches_in_file(
 ) -> Result<FileResult> {
     let html = std::fs::read(path)?;
     let matches = engine.count_matches(selector, &html)?;
+    trace!("{}: {} matches", path.display(), matches);
     Ok(FileResult {
         path: path.to_path_buf(),
         matches,
@@ -30,9 +32,11 @@ pub fn scan(
     selector: &str,
 ) -> Result<Vec<FileResult>> {
     if path.is_file() {
+        debug!("scanning file {} for selector '{}'", path.display(), selector);
         return Ok(vec![count_matches_in_file(engine, path, selector)?]);
     }
 
+    debug!("scanning directory {} for selector '{}'", path.display(), selector);
     let results: Vec<FileResult> = WalkDir::new(path)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -43,7 +47,7 @@ pub fn scan(
             match count_matches_in_file(engine, &file, selector) {
                 Ok(result) => Some(result),
                 Err(err) => {
-                    eprintln!("hq: {}: {err}", file.display());
+                    warn!("{}: {err}", file.display());
                     None
                 }
             }

@@ -4,6 +4,7 @@
 use crate::css::{self, CssRule};
 use crate::{Result, SelectorEngine};
 use jwalk::WalkDir;
+use log::{debug, info, trace};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -45,8 +46,10 @@ fn collect_files(path: &Path, filter: fn(&Path) -> bool) -> Result<Vec<PathBuf>>
 
 fn read_html_files(html_path: &Path) -> Result<Vec<Vec<u8>>> {
     let html_files = collect_files(html_path, is_html_file)?;
+    info!("loaded {} HTML files from {}", html_files.len(), html_path.display());
     let mut contents = Vec::with_capacity(html_files.len());
     for f in &html_files {
+        trace!("reading HTML file {}", f.display());
         contents.push(std::fs::read(f)?);
     }
     Ok(contents)
@@ -68,18 +71,24 @@ pub fn check_css(
     html_path: &Path,
 ) -> Result<Vec<CssFileResult>> {
     let css_files = collect_files(css_path, is_css_file)?;
+    info!("found {} CSS files in {}", css_files.len(), css_path.display());
     let html_contents = read_html_files(html_path)?;
 
     let mut results = Vec::with_capacity(css_files.len());
     for css_file in &css_files {
         let css_text = std::fs::read_to_string(css_file)?;
         let rules = css::extract_rules(&css_text)?;
+        debug!("{}: {} style rules to check", css_file.display(), rules.len());
 
         let selectors: Vec<SelectorResult> = rules
             .iter()
-            .map(|rule| SelectorResult {
-                selector: rule.selector.clone(),
-                used: selector_is_used(engine, &rule.selector, &html_contents),
+            .map(|rule| {
+                let used = selector_is_used(engine, &rule.selector, &html_contents);
+                debug!("{}: '{}' -> {}", css_file.display(), rule.selector, if used { "used" } else { "unused" });
+                SelectorResult {
+                    selector: rule.selector.clone(),
+                    used,
+                }
             })
             .collect();
 
@@ -115,6 +124,7 @@ pub fn prune(
             .filter(|rule| !selector_is_used(engine, &rule.selector, &html_contents))
             .collect();
 
+        debug!("{}: pruning {} unused rules", css_file.display(), unused.len());
         let content = css::prune_css(&css_text, &unused);
         pruned.push(PrunedFile {
             path: css_file.clone(),

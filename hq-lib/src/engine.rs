@@ -2,6 +2,7 @@
 // Licensed under the BSD 3-Clause License. See LICENSE file for details.
 
 use crate::Result;
+use log::trace;
 
 pub trait SelectorEngine: Send + Sync {
     fn count_matches(&self, selector: &str, html: &[u8]) -> Result<usize>;
@@ -41,7 +42,9 @@ impl SelectorEngine for LolHtmlEngine {
             .end()
             .map_err(|e| crate::Error::Selector(e.to_string()))?;
 
-        Ok(count.get())
+        let result = count.get();
+        trace!("selector '{}': {} matches", selector, result);
+        Ok(result)
     }
 }
 

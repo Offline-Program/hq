@@ -240,6 +240,7 @@ fn run_check_css(args: CheckCssArgs) {
 }
 
 fn main() {
+    env_logger::init();
     let cli = Cli::parse();
 
     match cli.command {

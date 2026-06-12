@@ -6,6 +6,7 @@ use cssparser::{
     AtRuleParser, CowRcStr, ParseError, Parser, ParserInput, ParserState,
     QualifiedRuleParser, StyleSheetParser,
 };
+use log::{debug, trace};
 
 #[derive(Debug, Clone)]
 pub struct CssRule {
@@ -29,6 +30,10 @@ pub fn extract_rules(css: &str) -> Result<Vec<CssRule>> {
                 return Err(crate::Error::CssParse(format!("{err:?}")));
             }
         }
+    }
+    debug!("extracted {} style rules from CSS", rules.len());
+    for rule in &rules {
+        trace!("rule: '{}' at bytes {}..{}", rule.selector, rule.start, rule.end);
     }
     Ok(rules)
 }
@@ -75,9 +80,10 @@ impl<'i> AtRuleParser<'i> for RuleExtractor {
 
     fn parse_prelude<'t>(
         &mut self,
-        _name: CowRcStr<'i>,
+        name: CowRcStr<'i>,
         input: &mut Parser<'i, 't>,
     ) -> std::result::Result<Self::Prelude, ParseError<'i, Self::Error>> {
+        trace!("skipping at-rule @{}", name);
         while input.next_including_whitespace_and_comments().is_ok() {}
         Ok(())
     }
