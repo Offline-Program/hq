@@ -7,6 +7,7 @@ use std::fmt;
 pub enum Error {
     Io(std::io::Error),
     Selector(String),
+    CssParse(String),
 }
 
 impl fmt::Display for Error {
@@ -14,6 +15,7 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "{e}"),
             Error::Selector(msg) => write!(f, "selector error: {msg}"),
+            Error::CssParse(msg) => write!(f, "css parse error: {msg}"),
         }
     }
 }
@@ -22,7 +24,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(e) => Some(e),
-            Error::Selector(_) => None,
+            Error::Selector(_) | Error::CssParse(_) => None,
         }
     }
 }

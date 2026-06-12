@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cssparser = "0.36"
 lol_html = "2"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }

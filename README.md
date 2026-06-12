@@ -68,10 +68,41 @@ Not supported:
 - Pseudo-classes beyond the above (`:last-child`, `:has()`, `:is()`, `:where()`, etc.)
 - Pseudo-elements (`::before`, `::after`, etc.)
 
+## CSS usage checking
+
+Find which CSS selectors are actually used in your HTML:
+
+```sh
+# Check which selectors in a CSS file are used by HTML files
+hq check-css --css styles.css --html ./site/
+
+# Prune unused rules, write to a new file
+hq check-css --css styles.css --html ./site/ --prune -o styles-clean.css
+
+# Prune a whole directory of CSS files
+hq check-css --css ./css/ --html ./site/ --prune --outdir ./css-clean/
+
+# JSONL output
+hq check-css --css styles.css --html ./site/ --json
+```
+
+Output:
+```
+styles.css
+  USED    .header
+  USED    div.content > p
+  UNUSED  .old-widget
+  UNUSED  #legacy-nav
+```
+
+Only simple style rules (selector + declaration block) are checked. At-rules (`@media`, `@keyframes`, `@font-face`, etc.) are left untouched during pruning.
+
 ## Exit codes
 
-| Code | Meaning |
-|------|---------|
-| 0    | At least one file had matches |
-| 1    | No files had matches |
-| 2    | Error (invalid selector, path not found, etc.) |
+| Command | Code | Meaning |
+|---------|------|---------|
+| `hq <SELECTOR>` | 0 | At least one file had matches |
+| `hq <SELECTOR>` | 1 | No files had matches |
+| `hq check-css`  | 0 | All selectors are used |
+| `hq check-css`  | 1 | Some selectors are unused |
+| (any)           | 2 | Error (invalid selector, path not found, etc.) |

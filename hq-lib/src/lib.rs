@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Red Hat, Inc.
 // Licensed under the BSD 3-Clause License. See LICENSE file for details.
 
+pub mod check_css;
+pub mod css;
 mod engine;
 mod error;
 mod scan;

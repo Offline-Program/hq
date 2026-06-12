@@ -46,12 +46,26 @@ pub struct FileResult {
 
 Prefer crates already in the dependency tree (including transitives) over adding new ones. Check `cargo tree` before adding a dependency.
 
+### CSS checking and pruning
+
+`css` module extracts simple (qualified) CSS rules with byte-offset spans using `cssparser`'s `StyleSheetParser`. At-rules (@media, @keyframes, etc.) are intentionally ignored — they pass through untouched during pruning.
+
+`check_css` module orchestrates: walks CSS and HTML files, tests each extracted selector against all HTML using `SelectorEngine`, and optionally prunes unused rules by removing their byte spans from the original source.
+
 ## CLI usage
 
 ```
 hq <SELECTOR> <PATH>
     --json        Output JSONL (one FileResult per line)
     --no-zeros    Omit files with zero matches
+
+hq check-css --css <PATH> --html <PATH>
+    --prune       Prune unused rules (requires -o or --outdir)
+    -o <FILE>     Output file (single CSS file input)
+    --outdir <DIR>  Output directory (directory CSS input)
+    --json        Output JSONL
 ```
 
-Exit code: 0 if any matches found, 1 if none, 2 on error.
+Exit codes:
+- `hq <SELECTOR>`: 0 if any matches, 1 if none, 2 on error
+- `hq check-css`: 0 if all selectors used, 1 if any unused, 2 on error

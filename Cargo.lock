@@ -339,6 +339,7 @@ dependencies = [
 name = "hq-lib"
 version = "0.1.0"
 dependencies = [
+ "cssparser",
  "jwalk",
  "lol_html",
  "rayon",
