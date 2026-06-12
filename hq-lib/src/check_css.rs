@@ -4,10 +4,11 @@
 use crate::css::{self, CssRule};
 use crate::{Result, SelectorEngine};
 use jwalk::WalkDir;
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SelectorResult {
@@ -21,6 +22,22 @@ pub struct CssFileResult {
     pub selectors: Vec<SelectorResult>,
 }
 
+pub struct PrunedFile {
+    pub path: PathBuf,
+    pub content: String,
+}
+
+struct SelectorEntry {
+    selector: String,
+    rule: CssRule,
+    used: AtomicBool,
+}
+
+struct CssFileEntry {
+    path: PathBuf,
+    rule_range: std::ops::Range<usize>,
+}
+
 fn is_css_file(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("css"))
@@ -31,39 +48,124 @@ fn is_html_file(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm"))
 }
 
-fn collect_files(path: &Path, filter: fn(&Path) -> bool) -> Result<Vec<PathBuf>> {
+fn walk_files(path: &Path, filter: fn(&Path) -> bool) -> Box<dyn Iterator<Item = PathBuf>> {
     if path.is_file() {
-        return Ok(vec![path.to_path_buf()]);
+        return Box::new(std::iter::once(path.to_path_buf()));
     }
-    let mut files: Vec<PathBuf> = WalkDir::new(path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type.is_file() && filter(&e.path()))
-        .map(|e| e.path())
-        .collect();
-    files.sort();
-    Ok(files)
+    Box::new(
+        WalkDir::new(path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(move |e| e.file_type.is_file() && filter(&e.path()))
+            .map(|e| e.path()),
+    )
 }
 
-fn read_html_files(html_path: &Path) -> Result<Vec<Vec<u8>>> {
-    let html_files = collect_files(html_path, is_html_file)?;
-    info!("loaded {} HTML files from {}", html_files.len(), html_path.display());
-    let mut contents = Vec::with_capacity(html_files.len());
-    for f in &html_files {
-        trace!("reading HTML file {}", f.display());
-        contents.push(std::fs::read(f)?);
-    }
-    Ok(contents)
+struct SelectorTable {
+    css_files: Vec<CssFileEntry>,
+    entries: Vec<SelectorEntry>,
 }
 
-fn selector_is_used(engine: &dyn SelectorEngine, selector: &str, html_contents: &[Vec<u8>]) -> bool {
-    for html in html_contents {
-        match engine.count_matches(selector, html) {
-            Ok(n) if n > 0 => return true,
-            _ => {}
+impl SelectorTable {
+    fn from_css_path(css_path: &Path) -> Result<Self> {
+        let mut css_files = Vec::new();
+        let mut entries = Vec::new();
+
+        for css_file in walk_files(css_path, is_css_file) {
+            let css_text = std::fs::read_to_string(&css_file)?;
+            let rules = css::extract_rules(&css_text)?;
+            let start = entries.len();
+
+            debug!("{}: {} style rules", css_file.display(), rules.len());
+            for rule in rules {
+                entries.push(SelectorEntry {
+                    selector: rule.selector.clone(),
+                    rule,
+                    used: AtomicBool::new(false),
+                });
+            }
+
+            css_files.push(CssFileEntry {
+                path: css_file,
+                rule_range: start..entries.len(),
+            });
         }
+
+        info!("parsed {} CSS files, {} selectors total", css_files.len(), entries.len());
+        Ok(SelectorTable { css_files, entries })
     }
-    false
+
+    fn test_html_file(&self, engine: &dyn SelectorEngine, html: &[u8]) {
+        let unsettled: Vec<usize> = self.entries.iter().enumerate()
+            .filter(|(_, e)| !e.used.load(Ordering::Relaxed))
+            .map(|(i, _)| i)
+            .collect();
+
+        unsettled.par_iter().for_each(|&i| {
+            let entry = &self.entries[i];
+            match engine.count_matches(&entry.selector, html) {
+                Ok(n) if n > 0 => {
+                    entry.used.store(true, Ordering::Relaxed);
+                    debug!("selector '{}' matched", entry.selector);
+                }
+                _ => {}
+            }
+        });
+    }
+
+    fn stream_html(&self, engine: &dyn SelectorEngine, html_path: &Path) {
+        let mut html_count = 0u64;
+        for html_file in walk_files(html_path, is_html_file) {
+            trace!("testing against {}", html_file.display());
+            match std::fs::read(&html_file) {
+                Ok(html) => {
+                    self.test_html_file(engine, &html);
+                    html_count += 1;
+                }
+                Err(e) => warn!("{}: {e}", html_file.display()),
+            }
+            // html bytes are dropped here
+        }
+        info!("streamed {} HTML files", html_count);
+    }
+
+    fn into_results(self) -> Vec<CssFileResult> {
+        self.css_files.iter().map(|cf| {
+            let selectors: Vec<SelectorResult> = self.entries[cf.rule_range.clone()]
+                .iter()
+                .map(|e| {
+                    let used = e.used.load(Ordering::Relaxed);
+                    debug!("{}: '{}' -> {}", cf.path.display(), e.selector, if used { "used" } else { "unused" });
+                    SelectorResult {
+                        selector: e.selector.clone(),
+                        used,
+                    }
+                })
+                .collect();
+            CssFileResult {
+                path: cf.path.clone(),
+                selectors,
+            }
+        }).collect()
+    }
+
+    fn into_pruned(self) -> Result<Vec<PrunedFile>> {
+        self.css_files.iter().map(|cf| {
+            let unused: Vec<CssRule> = self.entries[cf.rule_range.clone()]
+                .iter()
+                .filter(|e| !e.used.load(Ordering::Relaxed))
+                .map(|e| e.rule.clone())
+                .collect();
+
+            debug!("{}: pruning {} unused rules", cf.path.display(), unused.len());
+            let css_text = std::fs::read_to_string(&cf.path)?;
+            let content = css::prune_css(&css_text, &unused);
+            Ok(PrunedFile {
+                path: cf.path.clone(),
+                content,
+            })
+        }).collect()
+    }
 }
 
 pub fn check_css(
@@ -71,42 +173,9 @@ pub fn check_css(
     css_path: &Path,
     html_path: &Path,
 ) -> Result<Vec<CssFileResult>> {
-    let css_files = collect_files(css_path, is_css_file)?;
-    info!("found {} CSS files in {}", css_files.len(), css_path.display());
-    let html_contents = read_html_files(html_path)?;
-
-    let results: Result<Vec<CssFileResult>> = css_files
-        .par_iter()
-        .map(|css_file| {
-            let css_text = std::fs::read_to_string(css_file)?;
-            let rules = css::extract_rules(&css_text)?;
-            debug!("{}: {} style rules to check", css_file.display(), rules.len());
-
-            let selectors: Vec<SelectorResult> = rules
-                .par_iter()
-                .map(|rule| {
-                    let used = selector_is_used(engine, &rule.selector, &html_contents);
-                    debug!("{}: '{}' -> {}", css_file.display(), rule.selector, if used { "used" } else { "unused" });
-                    SelectorResult {
-                        selector: rule.selector.clone(),
-                        used,
-                    }
-                })
-                .collect();
-
-            Ok(CssFileResult {
-                path: css_file.clone(),
-                selectors,
-            })
-        })
-        .collect();
-
-    results
-}
-
-pub struct PrunedFile {
-    pub path: PathBuf,
-    pub content: String,
+    let table = SelectorTable::from_css_path(css_path)?;
+    table.stream_html(engine, html_path);
+    Ok(table.into_results())
 }
 
 pub fn prune(
@@ -114,30 +183,9 @@ pub fn prune(
     css_path: &Path,
     html_path: &Path,
 ) -> Result<Vec<PrunedFile>> {
-    let css_files = collect_files(css_path, is_css_file)?;
-    let html_contents = read_html_files(html_path)?;
-
-    let pruned: Result<Vec<PrunedFile>> = css_files
-        .par_iter()
-        .map(|css_file| {
-            let css_text = std::fs::read_to_string(css_file)?;
-            let rules = css::extract_rules(&css_text)?;
-
-            let unused: Vec<CssRule> = rules
-                .into_par_iter()
-                .filter(|rule| !selector_is_used(engine, &rule.selector, &html_contents))
-                .collect();
-
-            debug!("{}: pruning {} unused rules", css_file.display(), unused.len());
-            let content = css::prune_css(&css_text, &unused);
-            Ok(PrunedFile {
-                path: css_file.clone(),
-                content,
-            })
-        })
-        .collect();
-
-    pruned
+    let table = SelectorTable::from_css_path(css_path)?;
+    table.stream_html(engine, html_path);
+    table.into_pruned()
 }
 
 pub fn css_input_is_single_file(css_path: &Path) -> bool {

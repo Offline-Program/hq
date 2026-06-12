@@ -59,7 +59,10 @@ hq <SELECTOR> <PATH>
     --json        Output JSONL (one FileResult per line)
     --no-zeros    Omit files with zero matches
 
+hq check-css <PATH>
 hq check-css --css <PATH> --html <PATH>
+    --css <PATH>  CSS file or directory (overrides positional)
+    --html <PATH> HTML file or directory (overrides positional)
     --prune       Prune unused rules (requires -o or --outdir)
     -o <FILE>     Output file (single CSS file input)
     --outdir <DIR>  Output directory (directory CSS input)

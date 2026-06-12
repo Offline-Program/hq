@@ -38,13 +38,16 @@ enum Command {
 
 #[derive(Parser)]
 struct CheckCssArgs {
-    /// CSS file or directory
-    #[arg(long)]
-    css: PathBuf,
+    /// Directory to scan for both CSS and HTML files
+    path: Option<PathBuf>,
 
-    /// HTML file or directory
+    /// CSS file or directory (overrides positional path)
     #[arg(long)]
-    html: PathBuf,
+    css: Option<PathBuf>,
+
+    /// HTML file or directory (overrides positional path)
+    #[arg(long)]
+    html: Option<PathBuf>,
 
     /// Prune unused rules from CSS
     #[arg(long)]
@@ -128,10 +131,20 @@ fn run_query(selector: &str, path: &PathBuf, json: bool, no_zeros: bool) {
 }
 
 fn run_check_css(args: CheckCssArgs) {
+    let base = args.path.as_deref();
+    let css_path = args.css.as_deref().or(base).unwrap_or_else(|| {
+        eprintln!("hq: check-css requires a path or --css/--html flags");
+        process::exit(2);
+    });
+    let html_path = args.html.as_deref().or(base).unwrap_or_else(|| {
+        eprintln!("hq: check-css requires a path or --css/--html flags");
+        process::exit(2);
+    });
+
     let engine = LolHtmlEngine;
     let use_color = io::stdout().is_terminal();
 
-    let results = match hq_lib::check_css::check_css(&engine, &args.css, &args.html) {
+    let results = match hq_lib::check_css::check_css(&engine, css_path, html_path) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("hq: {e}");
@@ -175,7 +188,7 @@ fn run_check_css(args: CheckCssArgs) {
     drop(out);
 
     if args.prune {
-        let is_single = hq_lib::check_css::css_input_is_single_file(&args.css);
+        let is_single = hq_lib::check_css::css_input_is_single_file(css_path);
 
         if is_single && args.output.is_none() {
             eprintln!("hq: --prune requires -o <FILE> for single CSS file input");
@@ -186,7 +199,7 @@ fn run_check_css(args: CheckCssArgs) {
             process::exit(2);
         }
 
-        let pruned = match hq_lib::check_css::prune(&engine, &args.css, &args.html) {
+        let pruned = match hq_lib::check_css::prune(&engine, css_path, html_path) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("hq: {e}");
@@ -210,10 +223,10 @@ fn run_check_css(args: CheckCssArgs) {
             });
         } else {
             let outdir = args.outdir.unwrap();
-            let css_base = if args.css.is_dir() {
-                args.css.clone()
+            let css_base = if css_path.is_dir() {
+                css_path.to_path_buf()
             } else {
-                args.css.parent().unwrap_or(Path::new(".")).to_path_buf()
+                css_path.parent().unwrap_or(Path::new(".")).to_path_buf()
             };
 
             for pf in &pruned {
