@@ -3,6 +3,7 @@
 
 pub mod check_css;
 pub mod css;
+pub mod progress;
 mod engine;
 mod error;
 mod scan;

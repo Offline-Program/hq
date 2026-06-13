@@ -3,10 +3,14 @@
 
 use anstyle::{AnsiColor, Style};
 use clap::{Parser, Subcommand};
+use hq_lib::progress::Progress;
 use hq_lib::{FileResult, LolHtmlEngine, scan};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "hq", about = "Query HTML files by CSS selector")]
@@ -70,6 +74,8 @@ const BLUE: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::B
 const LIGHT_GREEN: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::BrightGreen)));
 const GREY: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::BrightBlack)));
 const RED: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Red)));
+const CYAN: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Cyan)));
+const YELLOW: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Yellow)));
 const RESET: anstyle::Reset = anstyle::Reset;
 
 fn print_human(results: &[FileResult], no_zeros: bool, use_color: bool) {
@@ -130,6 +136,42 @@ fn run_query(selector: &str, path: &PathBuf, json: bool, no_zeros: bool) {
     process::exit(if any_matches { 0 } else { 1 });
 }
 
+fn start_progress(progress: &Arc<Progress>) -> Option<std::thread::JoinHandle<()>> {
+    if !io::stderr().is_terminal() {
+        return None;
+    }
+    let p = Arc::clone(progress);
+    Some(std::thread::spawn(move || {
+        eprint!("\x1b[?25l");
+        while !p.done.load(Ordering::Relaxed) {
+            render_progress(&p);
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        eprint!("\x1b[2K\r\x1b[?25h");
+    }))
+}
+
+fn render_progress(p: &Progress) {
+    use std::fmt::Write as _;
+    let s = p.snapshot();
+    let mut buf = String::with_capacity(256);
+    let _ = write!(
+        buf,
+        "\x1b[2K\rcss: {CYAN}{}{RESET} files, {CYAN}{}{RESET} selectors {GREY}|{RESET} html: {CYAN}{}{RESET} scanned {GREY}|{RESET} used: {LIGHT_GREEN}{}{RESET} {GREY}({RESET}{LIGHT_GREEN}{:.0}%{RESET}{GREY}){RESET}, unused: {YELLOW}{}{RESET} {GREY}({RESET}{YELLOW}{}{RESET} bytes{GREY}){RESET}",
+        s.css_files, s.selectors, s.html_files, s.selectors_used, s.used_percent(), s.selectors_unused(), s.unused_bytes,
+    );
+    let mut err = io::stderr().lock();
+    let _ = err.write_all(buf.as_bytes());
+    let _ = err.flush();
+}
+
+fn stop_progress(progress: &Arc<Progress>, handle: Option<std::thread::JoinHandle<()>>) {
+    progress.done.store(true, Ordering::Relaxed);
+    if let Some(h) = handle {
+        let _ = h.join();
+    }
+}
+
 fn run_check_css(args: CheckCssArgs) {
     let base = args.path.as_deref();
     let css_path = args.css.as_deref().or(base).unwrap_or_else(|| {
@@ -143,10 +185,16 @@ fn run_check_css(args: CheckCssArgs) {
 
     let engine = LolHtmlEngine;
     let use_color = io::stdout().is_terminal();
+    let progress = Arc::new(Progress::new());
+    let handle = start_progress(&progress);
 
-    let results = match hq_lib::check_css::check_css(&engine, css_path, html_path) {
-        Ok(r) => r,
+    let results = match hq_lib::check_css::check_css(&engine, css_path, html_path, Some(&progress)) {
+        Ok(r) => {
+            stop_progress(&progress, handle);
+            r
+        }
         Err(e) => {
+            stop_progress(&progress, handle);
             eprintln!("hq: {e}");
             process::exit(2);
         }
@@ -199,7 +247,7 @@ fn run_check_css(args: CheckCssArgs) {
             process::exit(2);
         }
 
-        let pruned = match hq_lib::check_css::prune(&engine, css_path, html_path) {
+        let pruned = match hq_lib::check_css::prune(&engine, css_path, html_path, None) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("hq: {e}");
