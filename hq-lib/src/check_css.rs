@@ -3,8 +3,9 @@
 
 use crate::css::{self, CssRule};
 use crate::progress::Progress;
-use crate::{Result, SelectorEngine};
+use crate::Result;
 use jwalk::WalkDir;
+use lol_html::Selector as LolSelector;
 use log::{debug, info, trace, warn};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -30,6 +31,7 @@ pub struct PrunedFile {
 
 struct SelectorEntry {
     selector: String,
+    compiled: Option<LolSelector>,
     rule: CssRule,
     used: AtomicBool,
 }
@@ -49,7 +51,7 @@ fn is_html_file(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm"))
 }
 
-fn walk_files(path: &Path, filter: fn(&Path) -> bool) -> Box<dyn Iterator<Item = PathBuf>> {
+fn walk_files(path: &Path, filter: fn(&Path) -> bool) -> Box<dyn Iterator<Item = PathBuf> + Send> {
     if path.is_file() {
         return Box::new(std::iter::once(path.to_path_buf()));
     }
@@ -82,8 +84,13 @@ impl SelectorTable {
             let mut rule_bytes = 0u64;
             for rule in rules {
                 rule_bytes += (rule.end - rule.start) as u64;
+                let compiled = rule.selector.parse::<LolSelector>().ok();
+                if compiled.is_none() {
+                    trace!("cannot compile selector '{}', will skip matching", rule.selector);
+                }
                 entries.push(SelectorEntry {
                     selector: rule.selector.clone(),
+                    compiled,
                     rule,
                     used: AtomicBool::new(false),
                 });
@@ -105,49 +112,85 @@ impl SelectorTable {
         Ok(SelectorTable { css_files, entries })
     }
 
-    fn test_html_file(&self, engine: &dyn SelectorEngine, html: &[u8], progress: Option<&Progress>) {
+    fn test_html_file(&self, html: &[u8], progress: Option<&Progress>) {
+        use lol_html::{HtmlRewriter, Settings};
+        use std::borrow::Cow;
+        use std::cell::Cell;
+
         let unsettled: Vec<usize> = self.entries.iter().enumerate()
-            .filter(|(_, e)| !e.used.load(Ordering::Relaxed))
+            .filter(|(_, e)| !e.used.load(Ordering::Relaxed) && e.compiled.is_some())
             .map(|(i, _)| i)
             .collect();
 
-        unsettled.par_iter().for_each(|&i| {
-            let entry = &self.entries[i];
-            match engine.count_matches(&entry.selector, html) {
-                Ok(n) if n > 0 => {
-                    if entry.used.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                        if let Some(p) = progress {
-                            p.selectors_used.fetch_add(1, Ordering::Relaxed);
-                            let span = (entry.rule.end - entry.rule.start) as u64;
-                            p.unused_bytes.fetch_sub(span, Ordering::Relaxed);
-                        }
-                    }
-                    debug!("selector '{}' matched", entry.selector);
-                }
-                _ => {}
-            }
-        });
-    }
+        if unsettled.is_empty() {
+            return;
+        }
 
-    fn stream_html(&self, engine: &dyn SelectorEngine, html_path: &Path, progress: Option<&Progress>) {
-        let mut html_count = 0u64;
-        for html_file in walk_files(html_path, is_html_file) {
-            trace!("testing against {}", html_file.display());
-            match std::fs::read(&html_file) {
-                Ok(html) => {
-                    self.test_html_file(engine, &html, progress);
-                    html_count += 1;
+        let matched: Vec<Cell<bool>> = unsettled.iter().map(|_| Cell::new(false)).collect();
+
+        let handlers: Vec<_> = unsettled.iter().zip(matched.iter())
+            .map(|(&idx, flag)| {
+                let selector = self.entries[idx].compiled.as_ref().unwrap();
+                (
+                    Cow::Borrowed(selector),
+                    lol_html::ElementContentHandlers::default().element(
+                        move |_el: &mut lol_html::html_content::Element| {
+                            flag.set(true);
+                            Ok(())
+                        },
+                    ),
+                )
+            })
+            .collect();
+
+        let mut rewriter = HtmlRewriter::new(
+            Settings {
+                element_content_handlers: handlers,
+                ..Settings::new()
+            },
+            |_chunk: &[u8]| {},
+        );
+
+        if rewriter.write(html).is_err() || rewriter.end().is_err() {
+            return;
+        }
+
+        for (&idx, flag) in unsettled.iter().zip(matched.iter()) {
+            if flag.get() {
+                let entry = &self.entries[idx];
+                if entry.used.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
                     if let Some(p) = progress {
-                        p.html_files.fetch_add(1, Ordering::Relaxed);
+                        p.selectors_used.fetch_add(1, Ordering::Relaxed);
+                        let span = (entry.rule.end - entry.rule.start) as u64;
+                        p.unused_bytes.fetch_sub(span, Ordering::Relaxed);
                     }
                 }
-                Err(e) => warn!("{}: {e}", html_file.display()),
+                debug!("selector '{}' matched", entry.selector);
             }
         }
-        info!("streamed {} HTML files", html_count);
     }
 
-    fn into_results(self) -> Vec<CssFileResult> {
+    fn stream_html(&self, html_path: &Path, progress: Option<&Progress>) {
+        let html_count = std::sync::atomic::AtomicU64::new(0);
+        walk_files(html_path, is_html_file)
+            .par_bridge()
+            .for_each(|html_file| {
+                trace!("testing against {}", html_file.display());
+                match std::fs::read(&html_file) {
+                    Ok(html) => {
+                        self.test_html_file(&html, progress);
+                        html_count.fetch_add(1, Ordering::Relaxed);
+                        if let Some(p) = progress {
+                            p.html_files.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => warn!("{}: {e}", html_file.display()),
+                }
+            });
+        info!("streamed {} HTML files", html_count.load(Ordering::Relaxed));
+    }
+
+    fn to_results(&self) -> Vec<CssFileResult> {
         self.css_files.iter().map(|cf| {
             let selectors: Vec<SelectorResult> = self.entries[cf.rule_range.clone()]
                 .iter()
@@ -187,25 +230,25 @@ impl SelectorTable {
 }
 
 pub fn check_css(
-    engine: &dyn SelectorEngine,
     css_path: &Path,
     html_path: &Path,
     progress: Option<&Progress>,
 ) -> Result<Vec<CssFileResult>> {
     let table = SelectorTable::from_css_path(css_path, progress)?;
-    table.stream_html(engine, html_path, progress);
-    Ok(table.into_results())
+    table.stream_html(html_path, progress);
+    Ok(table.to_results())
 }
 
-pub fn prune(
-    engine: &dyn SelectorEngine,
+pub fn check_and_prune(
     css_path: &Path,
     html_path: &Path,
     progress: Option<&Progress>,
-) -> Result<Vec<PrunedFile>> {
+) -> Result<(Vec<CssFileResult>, Vec<PrunedFile>)> {
     let table = SelectorTable::from_css_path(css_path, progress)?;
-    table.stream_html(engine, html_path, progress);
-    table.into_pruned()
+    table.stream_html(html_path, progress);
+    let results = table.to_results();
+    let pruned = table.into_pruned()?;
+    Ok((results, pruned))
 }
 
 pub fn css_input_is_single_file(css_path: &Path) -> bool {
@@ -215,12 +258,7 @@ pub fn css_input_is_single_file(css_path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::LolHtmlEngine;
     use std::fs;
-
-    fn engine() -> LolHtmlEngine {
-        LolHtmlEngine
-    }
 
     // --- check_css ---
 
@@ -232,7 +270,7 @@ mod tests {
         fs::write(&css_file, ".used { color: red; }\n.unused { color: blue; }").unwrap();
         fs::write(&html_file, r#"<div class="used">hello</div>"#).unwrap();
 
-        let results = check_css(&engine(), &css_file, &html_file, None).unwrap();
+        let results = check_css(&css_file, &html_file, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].selectors.len(), 2);
         assert_eq!(results[0].selectors[0].selector, ".used");
@@ -247,7 +285,7 @@ mod tests {
         fs::write(dir.path().join("s.css"), "div { margin: 0; }\np { padding: 0; }").unwrap();
         fs::write(dir.path().join("p.html"), "<div><p>text</p></div>").unwrap();
 
-        let results = check_css(&engine(), &dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
+        let results = check_css(&dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
         assert!(results[0].selectors.iter().all(|s| s.used));
     }
 
@@ -257,7 +295,7 @@ mod tests {
         fs::write(dir.path().join("s.css"), ".ghost { x: 1; }\n#phantom { x: 2; }").unwrap();
         fs::write(dir.path().join("p.html"), "<div>no match</div>").unwrap();
 
-        let results = check_css(&engine(), &dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
+        let results = check_css(&dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
         assert!(results[0].selectors.iter().all(|s| !s.used));
     }
 
@@ -267,7 +305,7 @@ mod tests {
         fs::write(dir.path().join("s.css"), "span { color: red; }").unwrap();
         fs::write(dir.path().join("p.html"), "<span>hi</span>").unwrap();
 
-        let results = check_css(&engine(), &dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
+        let results = check_css(&dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
         assert!(results[0].selectors[0].used);
     }
 
@@ -277,7 +315,7 @@ mod tests {
         fs::write(dir.path().join("s.css"), "#main { width: 100%; }\n#missing { width: 50%; }").unwrap();
         fs::write(dir.path().join("p.html"), r#"<div id="main">content</div>"#).unwrap();
 
-        let results = check_css(&engine(), &dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
+        let results = check_css(&dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
         assert!(results[0].selectors[0].used);
         assert!(!results[0].selectors[1].used);
     }
@@ -288,7 +326,7 @@ mod tests {
         fs::write(dir.path().join("s.css"), "a[href] { color: blue; }\ninput[type=\"text\"] { border: 1px; }").unwrap();
         fs::write(dir.path().join("p.html"), r#"<a href="/">link</a><input type="checkbox">"#).unwrap();
 
-        let results = check_css(&engine(), &dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
+        let results = check_css(&dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
         assert!(results[0].selectors[0].used);
         assert!(!results[0].selectors[1].used);
     }
@@ -299,7 +337,7 @@ mod tests {
         fs::write(dir.path().join("s.css"), "nav a { text-decoration: none; }").unwrap();
         fs::write(dir.path().join("p.html"), "<nav><a href='/'>home</a></nav>").unwrap();
 
-        let results = check_css(&engine(), &dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
+        let results = check_css(&dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
         assert!(results[0].selectors[0].used);
     }
 
@@ -309,7 +347,7 @@ mod tests {
         fs::write(dir.path().join("s.css"), "ul > li { margin: 0; }").unwrap();
         fs::write(dir.path().join("p.html"), "<ul><li>item</li></ul>").unwrap();
 
-        let results = check_css(&engine(), &dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
+        let results = check_css(&dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
         assert!(results[0].selectors[0].used);
     }
 
@@ -324,7 +362,7 @@ mod tests {
         fs::write(html_dir.join("b.html"), "<div>still no match</div>").unwrap();
         fs::write(html_dir.join("c.html"), r#"<span class="rare">found</span>"#).unwrap();
 
-        let results = check_css(&engine(), &dir.path().join("s.css"), &html_dir, None).unwrap();
+        let results = check_css(&dir.path().join("s.css"), &html_dir, None).unwrap();
         assert!(results[0].selectors[0].used);
     }
 
@@ -340,7 +378,7 @@ mod tests {
         fs::write(css_dir.join("b.css"), ".bar { color: blue; }").unwrap();
         fs::write(html_dir.join("page.html"), r#"<div class="foo">x</div>"#).unwrap();
 
-        let results = check_css(&engine(), &css_dir, &html_dir, None).unwrap();
+        let results = check_css(&css_dir, &html_dir, None).unwrap();
         assert_eq!(results.len(), 2);
 
         let a = results.iter().find(|r| r.path.ends_with("a.css")).unwrap();
@@ -357,7 +395,7 @@ mod tests {
         fs::write(dir.path().join("notes.txt"), ".y { color: blue; }").unwrap();
         fs::write(dir.path().join("page.html"), r#"<div class="x">x</div>"#).unwrap();
 
-        let results = check_css(&engine(), dir.path(), dir.path(), None).unwrap();
+        let results = check_css(dir.path(), dir.path(), None).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].path.ends_with("style.css"));
     }
@@ -372,7 +410,7 @@ mod tests {
         fs::write(html_dir.join("page.html"), r#"<div class="x">x</div>"#).unwrap();
         fs::write(html_dir.join("data.json"), r#"{"class": "x"}"#).unwrap();
 
-        let results = check_css(&engine(), &dir.path().join("s.css"), &html_dir, None).unwrap();
+        let results = check_css(&dir.path().join("s.css"), &html_dir, None).unwrap();
         assert!(results[0].selectors[0].used);
     }
 
@@ -387,7 +425,7 @@ mod tests {
         ).unwrap();
         fs::write(dir.path().join("p.html"), r#"<div class="used">hello</div>"#).unwrap();
 
-        let pruned = prune(&engine(), &dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
+        let (_, pruned) = check_and_prune(&dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
         assert_eq!(pruned.len(), 1);
         assert!(pruned[0].content.contains(".used"));
         assert!(!pruned[0].content.contains(".unused"));
@@ -401,7 +439,7 @@ mod tests {
         fs::write(dir.path().join("s.css"), css).unwrap();
         fs::write(dir.path().join("p.html"), "<div><p>text</p></div>").unwrap();
 
-        let pruned = prune(&engine(), &dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
+        let (_, pruned) = check_and_prune(&dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
         assert_eq!(pruned[0].content, css);
     }
 
@@ -414,7 +452,7 @@ mod tests {
         ).unwrap();
         fs::write(dir.path().join("p.html"), "<div>nothing matches</div>").unwrap();
 
-        let pruned = prune(&engine(), &dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
+        let (_, pruned) = check_and_prune(&dir.path().join("s.css"), &dir.path().join("p.html"), None).unwrap();
         assert!(!pruned[0].content.contains(".a"));
         assert!(!pruned[0].content.contains(".b"));
         assert!(pruned[0].content.contains("@keyframes"));
@@ -430,7 +468,7 @@ mod tests {
         fs::write(css_dir.join("b.css"), ".also-dead { x: 3; }").unwrap();
         fs::write(dir.path().join("p.html"), r#"<div class="used">x</div>"#).unwrap();
 
-        let pruned = prune(&engine(), &css_dir, &dir.path().join("p.html"), None).unwrap();
+        let (_, pruned) = check_and_prune(&css_dir, &dir.path().join("p.html"), None).unwrap();
         assert_eq!(pruned.len(), 2);
 
         let a = pruned.iter().find(|p| p.path.ends_with("a.css")).unwrap();
@@ -454,7 +492,7 @@ mod tests {
         fs::write(html_dir.join("a.html"), r#"<div class="in-a">a</div>"#).unwrap();
         fs::write(html_dir.join("b.html"), r#"<div class="in-b">b</div>"#).unwrap();
 
-        let pruned = prune(&engine(), &dir.path().join("s.css"), &html_dir, None).unwrap();
+        let (_, pruned) = check_and_prune(&dir.path().join("s.css"), &html_dir, None).unwrap();
         assert!(pruned[0].content.contains(".in-a"));
         assert!(pruned[0].content.contains(".in-b"));
         assert!(!pruned[0].content.contains(".nowhere"));

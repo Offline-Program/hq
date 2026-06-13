@@ -142,23 +142,26 @@ fn start_progress(progress: &Arc<Progress>) -> Option<std::thread::JoinHandle<()
     }
     let p = Arc::clone(progress);
     Some(std::thread::spawn(move || {
+        let start = std::time::Instant::now();
         eprint!("\x1b[?25l");
         while !p.done.load(Ordering::Relaxed) {
-            render_progress(&p);
+            render_progress(&p, start.elapsed());
             std::thread::sleep(Duration::from_millis(30));
         }
         eprint!("\x1b[2K\r\x1b[?25h");
     }))
 }
 
-fn render_progress(p: &Progress) {
+fn render_progress(p: &Progress, elapsed: Duration) {
     use std::fmt::Write as _;
     let s = p.snapshot();
+    let secs = elapsed.as_secs_f64();
+    let html_per_sec = if secs > 0.0 { s.html_files as f64 / secs } else { 0.0 };
     let mut buf = String::with_capacity(256);
     let _ = write!(
         buf,
-        "\x1b[2K\rcss: {CYAN}{}{RESET} files, {CYAN}{}{RESET} selectors {GREY}|{RESET} html: {CYAN}{}{RESET} scanned {GREY}|{RESET} used: {LIGHT_GREEN}{}{RESET} {GREY}({RESET}{LIGHT_GREEN}{:.0}%{RESET}{GREY}){RESET}, unused: {YELLOW}{}{RESET} {GREY}({RESET}{YELLOW}{}{RESET} bytes{GREY}){RESET}",
-        s.css_files, s.selectors, s.html_files, s.selectors_used, s.used_percent(), s.selectors_unused(), s.unused_bytes,
+        "\x1b[2K\rcss: {CYAN}{}{RESET} files, {CYAN}{}{RESET} selectors {GREY}|{RESET} html: {CYAN}{}{RESET} scanned {GREY}({RESET}{CYAN}{:.0}{RESET}/s{GREY}){RESET} {GREY}|{RESET} used: {LIGHT_GREEN}{}{RESET} {GREY}({RESET}{LIGHT_GREEN}{:.0}%{RESET}{GREY}){RESET}, unused: {YELLOW}{}{RESET} {GREY}({RESET}{YELLOW}{}{RESET} bytes{GREY}){RESET}",
+        s.css_files, s.selectors, s.html_files, html_per_sec, s.selectors_used, s.used_percent(), s.selectors_unused(), s.unused_bytes,
     );
     let mut err = io::stderr().lock();
     let _ = err.write_all(buf.as_bytes());
@@ -183,20 +186,49 @@ fn run_check_css(args: CheckCssArgs) {
         process::exit(2);
     });
 
-    let engine = LolHtmlEngine;
     let use_color = io::stdout().is_terminal();
     let progress = Arc::new(Progress::new());
     let handle = start_progress(&progress);
 
-    let results = match hq_lib::check_css::check_css(&engine, css_path, html_path, Some(&progress)) {
-        Ok(r) => {
-            stop_progress(&progress, handle);
-            r
-        }
-        Err(e) => {
-            stop_progress(&progress, handle);
-            eprintln!("hq: {e}");
+    // Validate prune output flags before scanning
+    let pruning = if args.prune {
+        let is_single = hq_lib::check_css::css_input_is_single_file(css_path);
+        if is_single && args.output.is_none() {
+            eprintln!("hq: --prune requires -o <FILE> for single CSS file input");
             process::exit(2);
+        }
+        if !is_single && args.outdir.is_none() {
+            eprintln!("hq: --prune requires --outdir <DIR> for directory CSS input");
+            process::exit(2);
+        }
+        true
+    } else {
+        false
+    };
+
+    let (results, pruned) = if pruning {
+        match hq_lib::check_css::check_and_prune(css_path, html_path, Some(&*progress)) {
+            Ok((r, p)) => {
+                stop_progress(&progress, handle);
+                (r, Some(p))
+            }
+            Err(e) => {
+                stop_progress(&progress, handle);
+                eprintln!("hq: {e}");
+                process::exit(2);
+            }
+        }
+    } else {
+        match hq_lib::check_css::check_css(css_path, html_path, Some(&*progress)) {
+            Ok(r) => {
+                stop_progress(&progress, handle);
+                (r, None)
+            }
+            Err(e) => {
+                stop_progress(&progress, handle);
+                eprintln!("hq: {e}");
+                process::exit(2);
+            }
         }
     };
 
@@ -235,26 +267,8 @@ fn run_check_css(args: CheckCssArgs) {
     }
     drop(out);
 
-    if args.prune {
+    if let Some(pruned) = pruned {
         let is_single = hq_lib::check_css::css_input_is_single_file(css_path);
-
-        if is_single && args.output.is_none() {
-            eprintln!("hq: --prune requires -o <FILE> for single CSS file input");
-            process::exit(2);
-        }
-        if !is_single && args.outdir.is_none() {
-            eprintln!("hq: --prune requires --outdir <DIR> for directory CSS input");
-            process::exit(2);
-        }
-
-        let pruned = match hq_lib::check_css::prune(&engine, css_path, html_path, None) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("hq: {e}");
-                process::exit(2);
-            }
-        };
-
         if is_single {
             let out_path = args.output.unwrap();
             if let Some(parent) = out_path.parent() {

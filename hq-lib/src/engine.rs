@@ -6,6 +6,13 @@ use log::trace;
 
 pub trait SelectorEngine: Send + Sync {
     fn count_matches(&self, selector: &str, html: &[u8]) -> Result<usize>;
+
+    fn find_matches(&self, selectors: &[&str], html: &[u8]) -> Result<Vec<bool>> {
+        selectors
+            .iter()
+            .map(|s| self.count_matches(s, html).map(|n| n > 0))
+            .collect()
+    }
 }
 
 pub struct LolHtmlEngine;
@@ -45,6 +52,56 @@ impl SelectorEngine for LolHtmlEngine {
         let result = count.get();
         trace!("selector '{}': {} matches", selector, result);
         Ok(result)
+    }
+
+    fn find_matches(&self, selectors: &[&str], html: &[u8]) -> Result<Vec<bool>> {
+        use lol_html::{HtmlRewriter, Selector, Settings};
+        use std::borrow::Cow;
+        use std::cell::Cell;
+
+        if selectors.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let matched: Vec<Cell<bool>> = selectors.iter().map(|_| Cell::new(false)).collect();
+
+        let handlers: Vec<_> = selectors
+            .iter()
+            .zip(matched.iter())
+            .filter_map(|(sel, flag)| {
+                let parsed: Selector = match sel.parse() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        trace!("skipping unparseable selector '{}'", sel);
+                        return None;
+                    }
+                };
+                Some((
+                    Cow::Owned(parsed),
+                    lol_html::ElementContentHandlers::default().element(move |_el: &mut lol_html::html_content::Element| {
+                        flag.set(true);
+                        Ok(())
+                    }),
+                ))
+            })
+            .collect();
+
+        let mut rewriter = HtmlRewriter::new(
+            Settings {
+                element_content_handlers: handlers,
+                ..Settings::new()
+            },
+            |_chunk: &[u8]| {},
+        );
+
+        rewriter
+            .write(html)
+            .map_err(|e| crate::Error::Selector(e.to_string()))?;
+        rewriter
+            .end()
+            .map_err(|e| crate::Error::Selector(e.to_string()))?;
+
+        Ok(matched.iter().map(|f| f.get()).collect())
     }
 }
 
