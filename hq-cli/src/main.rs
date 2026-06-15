@@ -29,9 +29,9 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
-    /// Omit files with zero matches
+    /// Only show files with matches
     #[arg(long)]
-    no_zeros: bool,
+    matches_only: bool,
 }
 
 #[derive(Subcommand)]
@@ -78,10 +78,10 @@ const CYAN: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::C
 const YELLOW: Style = Style::new().fg_color(Some(anstyle::Color::Ansi(AnsiColor::Yellow)));
 const RESET: anstyle::Reset = anstyle::Reset;
 
-fn print_human(results: &[FileResult], no_zeros: bool, use_color: bool) {
+fn print_human(results: &[FileResult], matches_only: bool, use_color: bool) {
     let mut out = io::stdout().lock();
     for r in results {
-        if no_zeros && r.matches == 0 {
+        if matches_only && r.matches == 0 {
             continue;
         }
         if use_color {
@@ -96,23 +96,55 @@ fn print_human(results: &[FileResult], no_zeros: bool, use_color: bool) {
             let _ = writeln!(out, "{}\t{}", r.matches, r.path.display());
         }
     }
+
+    let total_matches: usize = results.iter().map(|r| r.matches).sum();
+    let files_with = results.iter().filter(|r| r.matches > 0).count();
+    let files_without = results.iter().filter(|r| r.matches == 0).count();
+
     if use_color {
+        let _ = write!(out, "\n{GREY}---{RESET}\n");
+        let _ = writeln!(out, "{CYAN}{total_matches}{RESET} matches across {LIGHT_GREEN}{files_with}{RESET} files, {GREY}{files_without}{RESET} files without matches");
         let _ = write!(out, "{RESET}");
+    } else {
+        let _ = writeln!(out, "\n---");
+        let _ = writeln!(out, "{total_matches} matches across {files_with} files, {files_without} files without matches");
     }
 }
 
-fn print_jsonl(results: &[FileResult], no_zeros: bool) {
+fn print_jsonl(results: &[FileResult], matches_only: bool) {
     let mut out = io::stdout().lock();
     for r in results {
-        if no_zeros && r.matches == 0 {
+        if matches_only && r.matches == 0 {
             continue;
         }
-        let _ = serde_json::to_writer(&mut out, r);
+        let _ = serde_json::to_writer(
+            &mut out,
+            &serde_json::json!({
+                "type": "file",
+                "path": r.path,
+                "matches": r.matches,
+            }),
+        );
         let _ = out.write_all(b"\n");
     }
+
+    let total_matches: usize = results.iter().map(|r| r.matches).sum();
+    let files_with = results.iter().filter(|r| r.matches > 0).count();
+    let files_without = results.iter().filter(|r| r.matches == 0).count();
+
+    let _ = serde_json::to_writer(
+        &mut out,
+        &serde_json::json!({
+            "type": "summary",
+            "total_matches": total_matches,
+            "files_with_matches": files_with,
+            "files_without_matches": files_without,
+        }),
+    );
+    let _ = out.write_all(b"\n");
 }
 
-fn run_query(selector: &str, path: &PathBuf, json: bool, no_zeros: bool) {
+fn run_query(selector: &str, path: &PathBuf, json: bool, matches_only: bool) {
     let engine = LolHtmlEngine;
 
     let mut results = match scan(&engine, path, selector) {
@@ -126,10 +158,10 @@ fn run_query(selector: &str, path: &PathBuf, json: bool, no_zeros: bool) {
     results.sort_by(|a, b| a.path.cmp(&b.path));
 
     if json {
-        print_jsonl(&results, no_zeros);
+        print_jsonl(&results, matches_only);
     } else {
         let use_color = io::stdout().is_terminal();
-        print_human(&results, no_zeros, use_color);
+        print_human(&results, matches_only, use_color);
     }
 
     let any_matches = results.iter().any(|r| r.matches > 0);
@@ -330,7 +362,7 @@ fn main() {
                 }
             };
             let path = cli.path.unwrap_or_else(|| PathBuf::from("."));
-            run_query(&selector, &path, cli.json, cli.no_zeros);
+            run_query(&selector, &path, cli.json, cli.matches_only);
         }
     }
 }

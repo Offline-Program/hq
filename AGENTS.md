@@ -57,7 +57,7 @@ Prefer crates already in the dependency tree (including transitives) over adding
 ```
 hq <SELECTOR> <PATH>
     --json        Output JSONL (one FileResult per line)
-    --no-zeros    Omit files with zero matches
+    --matches-only  Only show files with matches
 
 hq check-css <PATH>
 hq check-css --css <PATH> --html <PATH>
